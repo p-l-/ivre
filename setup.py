@@ -1,4 +1,4 @@
-#! /usr/bin/env python
+.#! /usr/bin/env python
 
 # This file is part of IVRE.
 # Copyright 2011 - 2021 Pierre LALET <pierre@droids-corp.org>
@@ -151,6 +151,7 @@ setup(
         "Programming Language :: Python :: 3.7",
         "Programming Language :: Python :: 3.8",
         "Programming Language :: Python :: 3.9",
+        "Programming Language :: Python :: 3.10",
         "Topic :: Scientific/Engineering :: Information Analysis",
         "Topic :: Security",
         "Topic :: System :: Networking",
