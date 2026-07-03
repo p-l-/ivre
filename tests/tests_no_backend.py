@@ -2821,6 +2821,334 @@ class ElasticDBSearchFieldTests(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------
+# ElasticDBStoreHostResilienceTests / DBViewMergeHostTests -- regression
+# coverage for GitHub issue #1886: pushing nmap ``view`` records to
+# Elasticsearch could abort partway through a ``db2view`` batch with an
+# uncaught ``mapper_parsing_exception``, because (a) unregistered NSE
+# script outputs (no entry in ``xmlnmap.CHANGE_TABLE_ELEMS`` /
+# ``ADD_TABLE_ELEMS`` / ``CHANGE_OUTPUT_TABLE_ELEMS``) can be
+# object-shaped with unbounded/varying sub-keys across hosts (e.g.
+# ``fingerprint-strings`` keyed by whichever NSE probe matched:
+# ``GetRequest``, ``Help``, ``Kerberos``...), which plain Elasticsearch
+# dynamic mapping types from the first document it sees and then
+# rejects on shape drift, and (b) ``ElasticDBActive.store_host`` had no
+# exception handling at all, so a single bad document killed the whole
+# ``pool.imap`` iteration in ``ivre/tools/db2view.py``.
+#
+# An earlier version of this fix also added a "flattened" dynamic
+# template on ``ports.scripts.*`` to absorb the shape drift at the
+# mapping level. That template made Elasticsearch reject *every*
+# ``regexp`` query against a keyed sub-field of any object-shaped
+# script output (not just the drift-prone ones) -- including
+# ``ssh2-enum-algos.hassh.*``, which ``searchhassh`` queries with
+# ``regexp`` for pattern inputs (see ``ElasticDBActive.searchhassh``,
+# ``ivre/db/elastic.py``) -- because Elasticsearch does not support
+# ``regexp``/wildcard queries on keyed ``flattened`` fields in any
+# version (confirmed on 7.17). That regression was caught by
+# ``tests.py::test_50_view``'s ``_test_hassh`` in CI and reverted;
+# the fix here is resilience-only (log-and-skip), with shape
+# normalization handled at the source in ``ivre/xmlnmap.py`` instead
+# (see the ``fingerprint-strings`` handling added separately).
+#
+# ``store_host`` originally caught bare ``Exception``, which also
+# swallowed connectivity/authentication/topology errors -- an outage
+# mid-batch would silently log one warning per host and "succeed"
+# with an empty index instead of failing the run. It now only
+# catches ``RequestError`` (the 400-class, per-document,
+# content-dependent rejection -- mapper_parsing_exception,
+# strict_dynamic_mapping_exception, illegal_argument_exception...);
+# everything else propagates. ``MongoDBActive.store_host`` had the
+# same over-broad catch and is tightened the same way, to
+# ``(WriteError, InvalidDocument)`` (server-side per-document
+# validation failures, including the ``DuplicateKeyError`` subclass,
+# and client-side BSON encoding failures such as
+# ``DocumentTooLarge``); connectivity/topology errors
+# (``ConnectionFailure``, ``AutoReconnect``, ``NotPrimaryError``,
+# ``ConfigurationError``) propagate there too.
+# ---------------------------------------------------------------------
+
+
+@unittest.skipUnless(
+    _HAVE_ELASTICSEARCH_DSL,
+    "elasticsearch_dsl is required (install with the ``elasticsearch`` extras)",
+)
+class ElasticDBStoreHostResilienceTests(unittest.TestCase):
+    """Pin the log-and-skip-on-``RequestError``-only behaviour of
+    :meth:`ElasticDBActive.store_host`.
+    """
+
+    class _StubEsClient:
+        def __init__(self, index_exception=None):
+            self.indexed: list = []
+            self._index_exception = index_exception
+
+        def index(self, index=None, body=None):
+            if self._index_exception is not None:
+                raise self._index_exception
+            self.indexed.append((index, body))
+            return {"_id": "stub-doc-id", "result": "created"}
+
+    @staticmethod
+    def _view(index_exception=None):
+        from urllib.parse import urlparse
+
+        from ivre.db.elastic import ElasticDBView
+
+        view = ElasticDBView(urlparse("elastic://localhost:9200/ivre"))
+        # Bypass the lazy ``db_client`` property (which would try to
+        # build a real ``Elasticsearch(...)`` client) by pre-setting
+        # the cached attribute directly.
+        view._db_client = (  # pylint: disable=protected-access
+            ElasticDBStoreHostResilienceTests._StubEsClient(index_exception)
+        )
+        return view
+
+    @staticmethod
+    def _request_error():
+        # A minimal, but fully-functional, ``RequestError`` instance:
+        # its ``__str__``/``__repr__`` only need ``.meta.status`` and
+        # ``.body``, so a bare namespace stands in for the real
+        # ``elastic_transport.ApiResponseMeta`` without coupling this
+        # test to that class's own constructor.
+        import types
+
+        from elasticsearch import RequestError
+
+        return RequestError(
+            "mapper_parsing_exception",
+            types.SimpleNamespace(status=400),
+            "failed to parse",
+        )
+
+    def test_store_host_returns_truthy_id_on_success(self):
+        view = self._view()
+        result = view.store_host({"addr": "1.2.3.4", "ports": []})
+        self.assertEqual(result, "stub-doc-id")
+        self.assertEqual(len(view.db_client.indexed), 1)
+
+    def test_store_host_logs_and_returns_none_on_request_error(self):
+        view = self._view(index_exception=self._request_error())
+        with self.assertLogs(ivre.utils.LOGGER, level="WARNING") as cm:
+            result = view.store_host({"addr": "1.2.3.4", "ports": []})
+        self.assertIsNone(result)
+        self.assertTrue(any("Cannot insert host" in line for line in cm.output))
+
+    def test_store_host_propagates_non_request_errors(self):
+        # A connectivity/outage/misconfiguration error (anything that
+        # is not a ``RequestError``) must abort the batch instead of
+        # being silently logged and skipped.
+        view = self._view(index_exception=ConnectionError("no route to host"))
+        with self.assertRaises(ConnectionError):
+            view.store_host({"addr": "1.2.3.4", "ports": []})
+
+
+class MongoDBStoreHostResilienceTests(unittest.TestCase):
+    """Mongo-side counterpart of
+    :class:`ElasticDBStoreHostResilienceTests`: pin the
+    log-and-skip-on-``(WriteError, InvalidDocument)``-only behaviour
+    of :meth:`MongoDBActive.store_host`. It originally caught bare
+    ``Exception``, which also swallowed connectivity/authentication/
+    topology errors (``ConnectionFailure``, ``AutoReconnect``,
+    ``NotPrimaryError``, ``ConfigurationError``) instead of letting
+    them fail the batch loudly.
+    """
+
+    class _StubCollection:
+        def __init__(self, insert_exception=None):
+            self.inserted: list = []
+            self._insert_exception = insert_exception
+
+        def insert_one(self, host):
+            import types
+
+            if self._insert_exception is not None:
+                raise self._insert_exception
+            self.inserted.append(host)
+            return types.SimpleNamespace(inserted_id="stub-object-id")
+
+    @staticmethod
+    def _view(insert_exception=None):
+        from ivre.db.mongo import MongoDBView
+
+        class _StubView(MongoDBView):
+            def __init__(self):  # pylint: disable=super-init-not-called
+                # Deliberately skip DB.__init__: store_host() only
+                # touches self.columns / self.column_hosts / self.db.
+                # ``MongoDB.db`` is a ``@property`` returning
+                # ``self._db.db`` (``self._db`` is a
+                # ``MongoDBConnection`` wrapper, not the raw
+                # dict-like database), so it is overridden directly
+                # here rather than faked via ``self._db``.
+                self.columns = ["hosts"]
+                self._collection = MongoDBStoreHostResilienceTests._StubCollection(
+                    insert_exception
+                )
+
+            @property
+            def db(self):
+                return {"hosts": self._collection}
+
+        return _StubView()
+
+    def test_store_host_returns_ident_on_success(self):
+        view = self._view()
+        result = view.store_host({"addr": "1.2.3.4", "ports": []})
+        self.assertEqual(result, "stub-object-id")
+        self.assertEqual(len(view.db["hosts"].inserted), 1)
+
+    def test_store_host_logs_and_returns_none_on_write_error(self):
+        from pymongo.errors import WriteError
+
+        view = self._view(insert_exception=WriteError("Document failed validation"))
+        with self.assertLogs(ivre.utils.LOGGER, level="WARNING") as cm:
+            result = view.store_host({"addr": "1.2.3.4", "ports": []})
+        self.assertIsNone(result)
+        self.assertTrue(any("Cannot insert host" in line for line in cm.output))
+
+    def test_store_host_logs_and_returns_none_on_invalid_document(self):
+        from pymongo.errors import InvalidDocument
+
+        view = self._view(insert_exception=InvalidDocument("cannot encode object"))
+        with self.assertLogs(ivre.utils.LOGGER, level="WARNING") as cm:
+            result = view.store_host({"addr": "1.2.3.4", "ports": []})
+        self.assertIsNone(result)
+        self.assertTrue(any("Cannot insert host" in line for line in cm.output))
+
+    def test_store_host_propagates_connection_errors(self):
+        from pymongo.errors import AutoReconnect
+
+        view = self._view(insert_exception=AutoReconnect("no primary available"))
+        with self.assertRaises(AutoReconnect):
+            view.store_host({"addr": "1.2.3.4", "ports": []})
+
+
+class DBViewMergeHostTests(unittest.TestCase):
+    """Pin :meth:`ivre.db.DBView.merge_host`'s data-safety contract:
+    the pre-existing record must only be removed once the merged
+    replacement has actually been stored. Hardening
+    ``ElasticDBActive.store_host`` to log-and-skip instead of raising
+    (see :class:`ElasticDBStoreHostResilienceTests`) would otherwise
+    turn a crash into silent data loss here, since ``merge_host``
+    used to call ``self.remove(rec)`` unconditionally right after
+    ``store_host``.
+    """
+
+    @staticmethod
+    def _stub_view(store_result):
+        from ivre.db import DBView
+
+        class _StubView(DBView):
+            def __init__(self):  # pylint: disable=super-init-not-called
+                # Deliberately skip DB.__init__: it only wires up an
+                # argparse parser this test does not need.
+                self.stored: list = []
+                self.removed: list = []
+                self.store_result = store_result
+
+            def searchhost(self, addr, neg=False):
+                return {"addr": addr}
+
+            def get(self, flt, **kwargs):
+                return iter([{"addr": flt["addr"], "existing": True}])
+
+            @staticmethod
+            def merge_host_docs(rec1, rec2):
+                return {**rec1, **rec2, "merged": True}
+
+            def store_host(self, host):
+                self.stored.append(host)
+                return self.store_result
+
+            def remove(self, host):
+                self.removed.append(host)
+
+        return _StubView()
+
+    def test_merge_host_removes_old_record_on_successful_store(self):
+        view = self._stub_view(store_result="new-id")
+        result = view.merge_host({"addr": "1.2.3.4", "new": True})
+        self.assertTrue(result)
+        self.assertEqual(len(view.stored), 1)
+        self.assertEqual(view.removed, [{"addr": "1.2.3.4", "existing": True}])
+
+    def test_merge_host_keeps_old_record_when_store_fails(self):
+        # ``store_host`` returning ``None`` signals a logged,
+        # swallowed failure (e.g. an Elasticsearch
+        # mapper_parsing_exception). The pre-existing record must
+        # survive so the caller's ``store_or_merge_host`` fallback
+        # (storing the unmerged ``host``) is the only data at risk,
+        # not a silent deletion of ``rec``.
+        view = self._stub_view(store_result=None)
+        result = view.merge_host({"addr": "1.2.3.4", "new": True})
+        self.assertFalse(result)
+        self.assertEqual(len(view.stored), 1)
+        self.assertEqual(view.removed, [])
+
+
+class XmlnmapFingerprintStringsNormalizationTests(unittest.TestCase):
+    """Regression coverage for ``xmlnmap.change_fingerprint_strings``
+    (issue #1886): the "fingerprint-strings" NSE script's structured
+    output is keyed by whichever service-fingerprinting probe(s)
+    matched (``GetRequest``, ``HTTPOptions``, ``Kerberos``...), which
+    varies per host. That dynamic key set (and, depending on nmap's
+    raw XML shape for a given invocation, dict-vs-list ambiguity) is
+    exactly the kind of drift that made
+    ``ports.scripts.fingerprint-strings`` mapping-drift prone on the
+    Elasticsearch backend. This is normalized at parse time to a
+    stable list-of-``{"name": ..., "value": ...}`` shape, mirroring
+    the existing "avoid data in field names" convention already used
+    for e.g. ``http-headers``, ``fcrdns``, ``vulns``.
+    """
+
+    def test_registered_in_change_table_elems(self):
+        self.assertIn("fingerprint-strings", xmlnmap.CHANGE_TABLE_ELEMS)
+        self.assertIs(
+            xmlnmap.CHANGE_TABLE_ELEMS["fingerprint-strings"],
+            xmlnmap.change_fingerprint_strings,
+        )
+
+    def test_single_probe_match(self):
+        self.assertEqual(
+            xmlnmap.change_fingerprint_strings({"GetRequest": "text-a"}),
+            [{"name": "GetRequest", "value": "text-a"}],
+        )
+
+    def test_multiple_probe_matches_preserve_all_entries(self):
+        result = xmlnmap.change_fingerprint_strings(
+            {"GetRequest": "text-a", "HTTPOptions": "text-b"}
+        )
+        self.assertEqual(
+            {(elt["name"], elt["value"]) for elt in result},
+            {("GetRequest", "text-a"), ("HTTPOptions", "text-b")},
+        )
+
+    def test_two_hosts_with_different_probe_names_produce_same_shape(self):
+        # The actual issue #1886 regression: two hosts reporting
+        # *different* NSE probe names for the same script id must now
+        # produce the exact same JSON shape (a list of
+        # ``{"name": ..., "value": ...}`` dicts each), not a dict
+        # whose key set varies per host -- which is what Elasticsearch
+        # dynamic mapping cannot absorb.
+        host_one = xmlnmap.change_fingerprint_strings({"GetRequest": "text-a"})
+        host_two = xmlnmap.change_fingerprint_strings({"Kerberos": "text-b"})
+        self.assertTrue(all(isinstance(elt, dict) for elt in host_one + host_two))
+        self.assertEqual(
+            {frozenset(elt) for elt in host_one + host_two},
+            {frozenset({"name", "value"})},
+        )
+
+    def test_non_dict_input_passed_through_unchanged(self):
+        # Defensive fallback for the (unobserved in practice) case
+        # where nmap emits fingerprint-strings without a `key`
+        # attribute on the first XML child, producing a list rather
+        # than a dict in xmlnmap's SAX handler -- mirrors the same
+        # ``isinstance(table, dict)`` guard used by the sibling
+        # ``change_http_server_header`` / ``change_http_default_accounts``
+        # handlers.
+        self.assertEqual(xmlnmap.change_fingerprint_strings(["a", "b"]), ["a", "b"])
+
+
+# ---------------------------------------------------------------------
 # ElasticDBSearchTextTests -- pin the wire shape of the
 # Elasticsearch ``searchtext()`` helper added alongside the
 # PostgreSQL and DuckDB sibling implementations.  Closes the
