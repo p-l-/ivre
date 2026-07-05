@@ -878,6 +878,18 @@ class RirBackendTests(unittest.TestCase):
         flt_or = hdb.flt_or(hdb.searchhost("1.1.1.1"), hdb.searchhost("8.8.8.8"))
         self.assertEqual(flt_or["f"], "or")
         self.assertEqual(len(flt_or["a"]), 2)
+        # The zero-argument combinators are not resolved locally:
+        # the HTTP backend is a pure proxy and forwards the empty
+        # conjunction / disjunction for the remote backend to
+        # resolve (match-everything / match-nothing respectively).
+        self.assertEqual(hdb.flt_and(), {"f": "and", "a": []})
+        self.assertEqual(hdb.flt_or(), {"f": "or", "a": []})
+        # ``searchnonexistent`` needs no explicit HTTP override:
+        # ``HttpDB.__getattribute__`` synthesizes every ``search*``
+        # method as a sealed dict, so the base-class
+        # ``NotImplementedError`` declaration is shadowed and the
+        # primitive is forwarded to the remote like any other.
+        self.assertEqual(hdb.searchnonexistent(), {"f": "nonexistent"})
 
     def test_filter_round_trips_through_parse_filter(self):
         """A filter built by `HttpDBRir` is JSON-serialised on the
@@ -928,6 +940,40 @@ class RirBackendTests(unittest.TestCase):
         self.assertEqual(country_call[1], ("FR",))
         text_call = next(c for c in calls if c[0] == "searchtext")
         self.assertEqual(text_call[1], ("orange",))
+
+    def test_empty_flt_or_round_trips_to_remote_flt_or(self):
+        """A zero-argument ``flt_or()`` is not resolved locally:
+        the HTTP backend forwards ``{"f": "or", "a": []}`` over
+        the wire and the server-side ``parse_filter`` calls the
+        target backend's ``flt_or()`` with no argument, which
+        matches nothing there."""
+        from urllib.parse import urlparse
+
+        from ivre.db.http import HttpDBRir
+        from ivre.web.utils import parse_filter
+
+        hdb = HttpDBRir(urlparse("http://x"))
+        wire = json.loads(json.dumps(hdb.flt_or()))
+        self.assertEqual(wire, {"f": "or", "a": []})
+
+        calls = []
+
+        class _StubDBRir:
+            flt_empty = {}
+
+            @staticmethod
+            def flt_and(*args):
+                calls.append(("flt_and", args))
+                return ("EVERYTHING",)
+
+            @staticmethod
+            def flt_or(*args):
+                calls.append(("flt_or", args))
+                return ("NOTHING",)
+
+        result = parse_filter(_StubDBRir(), wire)
+        self.assertEqual(calls, [("flt_or", ())])
+        self.assertEqual(result, ("NOTHING",))
 
     def test_get_best_inherits_from_dbrir(self):
         """`HttpDBRir.get_best` must be inherited unchanged from
@@ -14275,6 +14321,222 @@ class MongoDBSearchFieldTests(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------
+# DBFltCombineContractTests / MongoDBFltCombineTests /
+# ElasticDBFltCombineTests / SQLDBRirFltCombineTests -- the
+# ``flt_or`` / ``flt_and`` filter combinators and their
+# vacuous-case contract: an empty conjunction matches everything
+# (``flt_empty``), an empty disjunction matches nothing
+# (``searchnonexistent()``).
+# ---------------------------------------------------------------------
+
+
+class DBFltCombineContractTests(unittest.TestCase):
+    """Pin the backend-independent ``DB.flt_and`` / ``DB.flt_or``
+    vacuous-case contract on a minimal stub backend: ``flt_and()``
+    is vacuously true (``flt_empty``), ``flt_or()`` is vacuously
+    false (``searchnonexistent()``)."""
+
+    @staticmethod
+    def _Stub():
+        from ivre.db import DB
+
+        class _StubDB(DB):
+            flt_empty = "EMPTY"
+
+            @staticmethod
+            def _flt_and(cond1, cond2):
+                return ("AND", cond1, cond2)
+
+            @staticmethod
+            def _flt_or(cond1, cond2):
+                return ("OR", cond1, cond2)
+
+            @classmethod
+            def searchnonexistent(cls):
+                return "NOTHING"
+
+        return _StubDB
+
+    def test_flt_and_zero_args_matches_everything(self):
+        self.assertEqual(self._Stub().flt_and(), "EMPTY")
+
+    def test_flt_or_zero_args_matches_nothing(self):
+        self.assertEqual(self._Stub().flt_or(), "NOTHING")
+
+    def test_flt_or_non_empty_args_reduce_unchanged(self):
+        Stub = self._Stub()
+        self.assertEqual(Stub.flt_or("a"), "a")
+        self.assertEqual(Stub.flt_or("a", "b"), ("OR", "a", "b"))
+
+    def test_flt_or_zero_args_without_searchnonexistent_raises(self):
+        # ``searchnonexistent`` is declared on the base ``DB``
+        # with ``raise NotImplementedError`` (like ``_flt_or``):
+        # a backend missing the match-nothing primitive fails
+        # loudly and explicitly on ``flt_or()`` instead of with
+        # an obscure ``AttributeError``.
+        from ivre.db import DB
+
+        class _NoNonexistentDB(DB):
+            flt_empty = "EMPTY"
+
+            @staticmethod
+            def _flt_or(cond1, cond2):
+                return ("OR", cond1, cond2)
+
+        with self.assertRaises(NotImplementedError):
+            _NoNonexistentDB.flt_or()
+        with self.assertRaises(NotImplementedError):
+            DB.searchnonexistent()
+
+
+class MongoDBFltCombineTests(unittest.TestCase):
+    """Pin the ``MongoDB.flt_or`` combinator contract: without
+    arguments it matches nothing (``searchnonexistent()``, i.e.
+    ``{"_id": 0}``), following the base-class vacuous-case
+    contract, while ``flt_and()`` keeps matching everything
+    (``flt_empty``)."""
+
+    @staticmethod
+    def _M():
+        from ivre.db.mongo import MongoDB
+
+        return MongoDB
+
+    def test_flt_or_zero_args_matches_nothing(self):
+        M = self._M()
+        self.assertEqual(M.flt_or(), M.searchnonexistent())
+        self.assertEqual(M.flt_or(), {"_id": 0})
+
+    def test_flt_and_zero_args_matches_everything(self):
+        # Asymmetry pin: the vacuous conjunction stays true.
+        M = self._M()
+        self.assertEqual(M.flt_and(), M.flt_empty)
+
+    def test_flt_or_single_arg_returned_unchanged(self):
+        M = self._M()
+        flt = {"addr": 3232235777}
+        self.assertIs(M.flt_or(flt), flt)
+
+    def test_flt_or_many_args_wrapped_in_or(self):
+        M = self._M()
+        self.assertEqual(
+            M.flt_or({"addr": 1}, {"addr": 2}),
+            {"$or": [{"addr": 1}, {"addr": 2}]},
+        )
+
+
+@unittest.skipUnless(
+    _HAVE_ELASTICSEARCH_DSL,
+    "elasticsearch_dsl is required (install with the ``elasticsearch`` extras)",
+)
+class ElasticDBFltCombineTests(unittest.TestCase):
+    """The Elastic backend inherits the base-class ``flt_or`` (it
+    only defines ``_flt_or``), so the zero-argument case must
+    resolve to its ``searchnonexistent()`` query."""
+
+    def test_flt_or_zero_args_matches_nothing(self):
+        from ivre.db.elastic import ElasticDB
+
+        self.assertEqual(ElasticDB.flt_or(), ElasticDB.searchnonexistent())
+
+    def test_flt_and_zero_args_matches_everything(self):
+        from ivre.db.elastic import ElasticDB
+
+        self.assertEqual(ElasticDB.flt_and(), ElasticDB.flt_empty)
+
+
+@unittest.skipUnless(
+    _HAVE_SQLALCHEMY,
+    "sqlalchemy is required (install with the ``postgres`` or ``duckdb`` extras)",
+)
+class SQLDBRirFltCombineTests(unittest.TestCase):
+    """``SQLDBRir`` overrides ``flt_or`` with ``None``-dropping
+    clause combination (its ``flt_empty`` is ``None``): the
+    zero-argument case must match nothing (``WHERE false``),
+    while explicitly passed ``None`` arguments keep meaning
+    "absent optional filter" (dropped, no constraint added)."""
+
+    def test_flt_or_zero_args_matches_nothing(self):
+        from ivre.db.sql import SQLDBRir
+
+        clause = SQLDBRir.flt_or()
+        self.assertTrue(clause.compare(_sqlalchemy.false()))
+        self.assertTrue(SQLDBRir.searchnonexistent().compare(_sqlalchemy.false()))
+
+    def test_flt_or_none_args_add_no_constraint(self):
+        from ivre.db.sql import SQLDBRir
+
+        self.assertIsNone(SQLDBRir.flt_or(None))
+        self.assertIsNone(SQLDBRir.flt_or(None, None))
+
+    def test_flt_or_single_clause_passthrough(self):
+        from ivre.db.sql import SQLDBRir
+
+        clause = _sqlalchemy.column("x") == 1
+        self.assertIs(SQLDBRir.flt_or(clause, None), clause)
+
+
+@unittest.skipUnless(
+    _HAVE_SQLALCHEMY,
+    "sqlalchemy is required (install with the ``postgres`` or ``duckdb`` extras)",
+)
+class SQLDBFltEmptyClassAccessTests(unittest.TestCase):
+    """``SQLDB.flt_empty`` builds a fresh ``Filter`` and must do
+    so from *class* access too: the classmethod-based filter
+    builders (zero-argument ``flt_and()``, degenerate ``search*``
+    calls) reach it through ``cls``, where a plain ``@property``
+    used to return the raw descriptor object -- ``count()`` then
+    crashed with ``AttributeError: 'property' object has no
+    attribute 'query'`` on the PostgreSQL / DuckDB backends."""
+
+    def test_flt_and_zero_args_builds_filter(self):
+        # Direct regression pin for the zero-argument flt_and()
+        # crash: DB.flt_and is a classmethod, so its flt_empty
+        # fallback resolves on the class.
+        from ivre.db.sql import NmapFilter, PassiveFilter, SQLDBNmap, SQLDBPassive
+
+        self.assertIsInstance(SQLDBNmap.flt_and(), NmapFilter)
+        self.assertIsInstance(SQLDBPassive.flt_and(), PassiveFilter)
+
+    def test_flt_empty_class_access_builds_fresh_filters(self):
+        from ivre.db.sql import Filter, SQLDBNmap
+
+        first = SQLDBNmap.flt_empty
+        second = SQLDBNmap.flt_empty
+        self.assertIsInstance(first, Filter)
+        self.assertIsInstance(second, Filter)
+        # A fresh Filter per access: the objects are combined /
+        # mutated by callers, so no shared class-level state.
+        self.assertIsNot(first, second)
+
+    def test_flt_empty_instance_access_unchanged(self):
+        from urllib.parse import urlparse
+
+        from ivre.db.sql import NmapFilter, SQLDBNmap
+
+        # Instantiation only stores the URL; no connection is
+        # opened until ``.db`` is accessed.
+        inst = SQLDBNmap(urlparse("postgresql://ivre:ivre@localhost/ivre"))
+        self.assertIsInstance(inst.flt_empty, NmapFilter)
+
+    def test_degenerate_searchrecontype_builds_filter(self):
+        # ``searchrecontype()`` without arguments returns the
+        # match-all filter via ``cls.flt_empty`` -- another member
+        # of the class-access family.
+        from ivre.db.sql import PassiveFilter, SQLDBPassive
+
+        self.assertIsInstance(SQLDBPassive.searchrecontype(), PassiveFilter)
+
+    def test_rir_flt_empty_override_untouched(self):
+        # ``SQLDBRir`` shadows the descriptor with a plain
+        # ``flt_empty = None`` class attribute (raw-clause
+        # filters); the descriptor change must not affect it.
+        from ivre.db.sql import SQLDBRir
+
+        self.assertIsNone(SQLDBRir.flt_empty)
+
+
+# ---------------------------------------------------------------------
 # DnsMergeTests -- the cross-backend ``(name, addr)`` pseudo-record
 # merge helper used by both the ``ivre iphost`` CLI and the
 # ``/cgi/dns`` web endpoint.
@@ -17756,16 +18018,41 @@ class DBAuditAbstractSurfaceTests(unittest.TestCase):
         self.assertIn("audit", MetaDB.db_types)
         self.assertIs(MetaDB.db_types["audit"], DBAudit)
 
-    def test_audit_in_metadb_close_iteration(self) -> None:
-        # ``MetaDB.close()`` enumerates the purpose attributes it
-        # owns so the cached connection is released; missing the
-        # ``audit`` entry would leak the audit-store handle.
-        import inspect
-
+    def test_metadb_close_releases_every_cached_purpose(self) -> None:
+        # ``MetaDB.close()`` iterates ``db_types`` so the cached
+        # ``_<purpose>`` connection of *every* purpose (audit
+        # included) is released; a hand-maintained attribute list
+        # there previously drifted from ``db_types`` and leaked
+        # the ``rir`` / ``auth`` connections.
         from ivre.db import MetaDB
 
-        src = inspect.getsource(MetaDB.close)
-        self.assertIn('"audit"', src, "MetaDB.close() must iterate the audit attr")
+        closed: list[str] = []
+
+        class _FakeConn:
+            def __init__(self, purpose: str) -> None:
+                self._purpose = purpose
+
+            def close(self) -> None:
+                closed.append(self._purpose)
+
+        meta = MetaDB()
+        for purpose in MetaDB.db_types:
+            setattr(meta, f"_{purpose}", _FakeConn(purpose))
+        meta.close()
+        self.assertEqual(sorted(closed), sorted(MetaDB.db_types))
+
+    def test_metadb_close_tolerates_none_and_uncached_purposes(self) -> None:
+        # The ``auth`` property caches ``None`` when
+        # WEB_AUTH_ENABLED is off, ``get_class()`` returns
+        # ``None`` for unconfigured purposes, and purposes never
+        # accessed have no cached attribute at all: ``close()``
+        # must swallow all three shapes instead of raising.
+        from ivre.db import MetaDB
+
+        meta = MetaDB()
+        meta._auth = None
+        meta._data = None
+        meta.close()  # must not raise
 
     def test_metadb_has_audit_property(self) -> None:
         from ivre.db import DBAudit, MetaDB

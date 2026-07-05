@@ -462,6 +462,10 @@ class DB:
         """Returns a condition that is true iff all of the given
         conditions is true.
 
+        Without any argument, returns `flt_empty` (matches
+        everything): a conjunction over an empty set of conditions
+        is vacuously true.
+
         """
         if args:
             return reduce(cls._flt_and, args)
@@ -483,15 +487,35 @@ class DB:
         """Returns a condition that is true iff any of the given
         conditions is true.
 
+        Without any argument, returns `searchnonexistent()`
+        (matches nothing): a disjunction over an empty set of
+        conditions is vacuously false. This mirrors `flt_and()`,
+        which returns `flt_empty` (vacuously true), and keeps
+        callers building `flt_or(*alternatives)` from an empty
+        list of alternatives fail-closed instead of matching the
+        whole database.
+
         """
         if args:
             return reduce(cls._flt_or, args)
-        return cls.flt_empty
+        return cls.searchnonexistent()
 
     @staticmethod
     def _flt_or(cond1, cond2):
         """Returns a condition that is true iff either `cond1` or
         `cond2` is true.
+
+        This is typically implemented in the backend-specific
+        subclass.
+
+        """
+        raise NotImplementedError
+
+    @classmethod
+    def searchnonexistent(cls):
+        """Returns a filter that matches no record: the dual of
+        `flt_empty`, and the zero-argument :meth:`flt_or` result
+        (an empty disjunction is vacuously false).
 
         This is typically implemented in the backend-specific
         subclass.
@@ -6771,7 +6795,13 @@ class MetaDB:
         self.urls = urls or {}
 
     def close(self):
-        for attr in ["nmap", "passive", "data", "flow", "view", "notes", "audit"]:
+        # Iterate over the purposes declared in `db_types` (rather
+        # than a hand-maintained list that could miss some of them)
+        # so every cached `_<purpose>` connection is released.  The
+        # `AttributeError` guard covers purposes never accessed (no
+        # cached attribute), purposes without a backend (the cached
+        # value is None), and backends without a close() method.
+        for attr in self.db_types:
             try:
                 getattr(self, f"_{attr}").close()
             except AttributeError:

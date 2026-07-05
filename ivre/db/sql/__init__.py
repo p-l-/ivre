@@ -43,6 +43,7 @@ from sqlalchemy import (
     delete,
     desc,
     exists,
+    false,
     func,
     insert,
     join,
@@ -343,6 +344,24 @@ class _BufferedResult:
         return iter(self._rows)
 
 
+class _ClassOrInstanceProperty:
+    """A ``property``-like descriptor that also resolves on
+    *class* access: ``cls.flt_empty`` must build a fresh
+    ``Filter`` exactly like ``self.flt_empty`` does, because the
+    classmethod-based filter builders (``flt_and()`` without
+    arguments, degenerate ``search*`` calls such as
+    ``searchrecontype()``) reach it through ``cls``, where a
+    plain ``@property`` would return the raw descriptor object
+    instead of calling its getter.
+    """
+
+    def __init__(self, fget):
+        self.fget = fget
+
+    def __get__(self, obj, objtype=None):
+        return self.fget(obj if obj is not None else objtype)
+
+
 class SQLDB(DB):
     table_layout = namedtuple("empty_layout", [])
     tables = table_layout()
@@ -382,8 +401,11 @@ class SQLDB(DB):
             self._db = create_engine(self.dburl, echo=config.DEBUG_DB)
             return self._db
 
-    @property
+    @_ClassOrInstanceProperty
     def flt_empty(self):
+        # ``self`` may be the class itself (class access);
+        # ``base_filter`` is a class attribute (the purpose's
+        # ``Filter`` subclass) either way.
         return self.base_filter()
 
     def drop(self):
@@ -6129,6 +6151,12 @@ class SQLDBRir(SQLDB, DBRir):
             return not_(flt)
         return flt
 
+    @classmethod
+    def searchnonexistent(cls):
+        """A filter that matches nothing (``WHERE false``); the
+        zero-argument :meth:`flt_or` result."""
+        return false()
+
     @staticmethod
     def flt_and(*args):
         """Combine filter expressions via SQL ``AND``.
@@ -6144,9 +6172,20 @@ class SQLDBRir(SQLDB, DBRir):
             return clauses[0]
         return and_(*clauses)
 
-    @staticmethod
-    def flt_or(*args):
-        """Combine filter expressions via SQL ``OR``."""
+    @classmethod
+    def flt_or(cls, *args):
+        """Combine filter expressions via SQL ``OR``.
+
+        Without any argument, matches nothing (an empty
+        disjunction is vacuously false), like the base-class
+        :meth:`DB.flt_or`. ``None`` arguments are otherwise
+        dropped -- as in :meth:`flt_and`, a ``None`` stands for
+        an *absent* optional filter -- so ``flt_or(None)`` (some
+        arguments given, none of them actual filters) keeps
+        returning ``None`` (no constraint).
+        """
+        if not args:
+            return cls.searchnonexistent()
         clauses = [a for a in args if a is not None]
         if not clauses:
             return None

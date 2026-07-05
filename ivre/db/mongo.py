@@ -641,8 +641,12 @@ class MongoDB(DB):
                 cond.setdefault("$and", []).extend([{k: cond1[k]}, {k: cond2[k]}])
         return cond
 
-    @staticmethod
-    def flt_or(*args):
+    @classmethod
+    def flt_or(cls, *args):
+        # Zero-argument contract from the base class: an empty
+        # disjunction is vacuously false, so match nothing.
+        if not args:
+            return cls.searchnonexistent()
         return {"$or": list(args)} if len(args) > 1 else args[0]
 
     @staticmethod
